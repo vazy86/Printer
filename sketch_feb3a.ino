@@ -13,7 +13,7 @@ void setup() {
     // Инициализация Serial2 для принтера
     // 9600 baud, 8 data bits, No parity, 1 stop bit
     Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
-    
+
     // Увеличение буферов UART для надежности
     Serial2.setRxBufferSize(1024);
     Serial2.setTxBufferSize(1024);
@@ -436,7 +436,7 @@ void frameTest() {
 
     setupCyrillic();
 
-    const uint8_t lineWidth = 32;
+    const uint8_t lineWidth = 48;  // Font A: 48 символов на строку (576 точек / 12)
     String topBottom = "";
     for (uint8_t i = 0; i < lineWidth; i++) {
         topBottom += "*";
