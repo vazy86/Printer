@@ -1,8 +1,8 @@
-// Подключение термопринтера Nippon NP-F3092 к ESP32-C3
+// Подключение термопринтера Nippon NP-F309 к ESP32-S3
 // RS232 через MAX3232 + поддержка кириллицы CP1251
 
-#define PRINTER_RX 6  // Пин RX для Serial1 (подключен к TX MAX3232)
-#define PRINTER_TX 7  // Пин TX для Serial1 (подключен к RX MAX3232)
+#define RXD2 17  // Пин RX для Serial2 (подключен к TX MAX3232)
+#define TXD2 18  // Пин TX для Serial2 (подключен к RX MAX3232)
 
 void setup() {
     // Инициализация Serial для отладки
@@ -10,13 +10,13 @@ void setup() {
     delay(1000);
     Serial.println("Инициализация принтера...");
     
-    // Инициализация Serial1 для принтера (ESP32-C3 имеет UART0 и UART1)
+    // Инициализация Serial2 для принтера
     // 9600 baud, 8 data bits, No parity, 1 stop bit
-    Serial1.begin(9600, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
+    Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
 
     // Увеличение буферов UART для надежности
-    Serial1.setRxBufferSize(1024);
-    Serial1.setTxBufferSize(1024);
+    Serial2.setRxBufferSize(1024);
+    Serial2.setTxBufferSize(1024);
     
     delay(500);
     
@@ -117,7 +117,7 @@ void printCyrillicLine(String text) {
         // Проверка на UTF-8 многобайтовый символ
         if ((c & 0x80) == 0) {
             // ASCII символ (0x00-0x7F)
-            Serial1.write(c);
+            Serial2.write(c);
             i++;
         }
         else if ((c & 0xE0) == 0xC0) {
@@ -126,7 +126,7 @@ void printCyrillicLine(String text) {
                 uint8_t c2 = text[i + 1];
                 uint16_t utf8Code = ((c & 0x1F) << 6) | (c2 & 0x3F);
                 uint8_t cp1251 = utf8ToCp1251(utf8Code);
-                Serial1.write(cp1251);
+                Serial2.write(cp1251);
                 i += 2;
             } else {
                 i++;
@@ -139,7 +139,7 @@ void printCyrillicLine(String text) {
                 uint8_t c3 = text[i + 2];
                 uint16_t utf8Code = ((c & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F);
                 uint8_t cp1251 = utf8ToCp1251(utf8Code);
-                Serial1.write(cp1251);
+                Serial2.write(cp1251);
                 i += 3;
             } else {
                 i++;
@@ -152,8 +152,8 @@ void printCyrillicLine(String text) {
     }
     
     // Перевод строки
-    Serial1.write(0x0A);  // Line Feed
-    Serial1.flush();
+    Serial2.write(0x0A);  // Line Feed
+    Serial2.flush();
     delay(100);
 }
 
@@ -161,26 +161,26 @@ void printCyrillicLine(String text) {
 
 // Отправка команды из 2 байт
 void sendCommand(uint8_t cmd1, uint8_t cmd2) {
-    Serial1.write(cmd1);
-    Serial1.write(cmd2);
-    Serial1.flush();
+    Serial2.write(cmd1);
+    Serial2.write(cmd2);
+    Serial2.flush();
     delay(50);
 }
 
 // Отправка команды из 3 байт
 void sendCommand(uint8_t cmd1, uint8_t cmd2, uint8_t cmd3) {
-    Serial1.write(cmd1);
-    Serial1.write(cmd2);
-    Serial1.write(cmd3);
-    Serial1.flush();
+    Serial2.write(cmd1);
+    Serial2.write(cmd2);
+    Serial2.write(cmd3);
+    Serial2.flush();
     delay(50);
 }
 
 // Печать строки текста БЕЗ кириллицы (только ASCII)
 void printLine(String text) {
-    Serial1.print(text);
-    Serial1.write(0x0A);
-    Serial1.flush();
+    Serial2.print(text);
+    Serial2.write(0x0A);
+    Serial2.flush();
     delay(100);
 }
 
@@ -196,13 +196,13 @@ void selectCodepage(uint8_t codepage) {
 
 void feedDots(uint8_t dots) {
     sendCommand(0x1B, 0x4A, dots);  // ESC J n
-    Serial1.flush();
+    Serial2.flush();
     delay(300);
 }
 
 void partialCut() {
     sendCommand(0x1B, 0x6D);  // ESC m
-    Serial1.flush();
+    Serial2.flush();
     delay(600);
 }
 
@@ -269,7 +269,7 @@ void testPrint() {
     
     setAlignment(0);  // Влево
     printLine("Nippon NP-F309");
-    printLine("ESP32-C3 + RS232");
+    printLine("ESP32-S3 + RS232");
     printLine("Date: " + String(__DATE__));
     printLine("Time: " + String(__TIME__));
     
@@ -354,55 +354,55 @@ void advancedTest() {
 // Печать штрих-кода (пример для CODE39)
 void printBarcode(String data) {
     // Высота штрихкода
-    Serial1.write(0x1D);  // GS
-    Serial1.write(0x68);  // h
-    Serial1.write(100);   // 100 точек высота
-    Serial1.flush();
+    Serial2.write(0x1D);  // GS
+    Serial2.write(0x68);  // h
+    Serial2.write(100);   // 100 точек высота
+    Serial2.flush();
     delay(50);
     
     // Ширина модуля
-    Serial1.write(0x1D);  // GS
-    Serial1.write(0x77);  // w
-    Serial1.write(3);     // Ширина 3
-    Serial1.flush();
+    Serial2.write(0x1D);  // GS
+    Serial2.write(0x77);  // w
+    Serial2.write(3);     // Ширина 3
+    Serial2.flush();
     delay(50);
     
     // Позиция HRI символов (2=снизу)
-    Serial1.write(0x1D);  // GS
-    Serial1.write(0x48);  // H
-    Serial1.write(2);     // Снизу
-    Serial1.flush();
+    Serial2.write(0x1D);  // GS
+    Serial2.write(0x48);  // H
+    Serial2.write(2);     // Снизу
+    Serial2.flush();
     delay(50);
     
     // Печать штрихкода CODE39
-    Serial1.write(0x1D);  // GS
-    Serial1.write(0x6B);  // k
-    Serial1.write(0x04);  // m = CODE39
+    Serial2.write(0x1D);  // GS
+    Serial2.write(0x6B);  // k
+    Serial2.write(0x04);  // m = CODE39
     
     // Данные (должны начинаться и заканчиваться на *)
-    Serial1.print("*" + data + "*");
-    Serial1.write(0x00);  // NUL - конец данных
-    Serial1.flush();
+    Serial2.print("*" + data + "*");
+    Serial2.write(0x00);  // NUL - конец данных
+    Serial2.flush();
     delay(500);
 }
 
 // Печать QR-кода
 void printQRCode(String data) {
-    Serial1.write(0x1B);  // ESC
-    Serial1.write(0x71);  // q
-    Serial1.write(4);     // S - размер модуля (4 точки)
-    Serial1.write(0);     // E - уровень коррекции (0=L)
-    Serial1.write(0);     // V - версия (0=авто)
-    Serial1.write(0);     // M - маска (0=оптимальная)
+    Serial2.write(0x1B);  // ESC
+    Serial2.write(0x71);  // q
+    Serial2.write(4);     // S - размер модуля (4 точки)
+    Serial2.write(0);     // E - уровень коррекции (0=L)
+    Serial2.write(0);     // V - версия (0=авто)
+    Serial2.write(0);     // M - маска (0=оптимальная)
     
     // Длина данных (n1 + n2*256)
     uint16_t len = data.length();
-    Serial1.write(len & 0xFF);        // n1
-    Serial1.write((len >> 8) & 0xFF); // n2
+    Serial2.write(len & 0xFF);        // n1
+    Serial2.write((len >> 8) & 0xFF); // n2
     
     // Данные
-    Serial1.print(data);
-    Serial1.flush();
+    Serial2.print(data);
+    Serial2.flush();
     delay(1000);  // QR-коду нужно больше времени
 }
 
