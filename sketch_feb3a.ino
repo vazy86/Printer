@@ -30,8 +30,8 @@ WiFiClientSecure secureClient;
 // Изображения
 #define IMG_WIDTH       576
 #define IMG_BYTES_ROW   72    // 576 / 8
-#define IMG_MAX_HEIGHT  500
-#define MAX_JPEG_SIZE   100000
+#define IMG_MAX_HEIGHT  1200
+#define MAX_JPEG_SIZE   150000
 
 JPEGDEC jpeg;
 uint8_t* imgBitmap = nullptr;
