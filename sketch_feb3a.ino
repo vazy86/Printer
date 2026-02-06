@@ -37,7 +37,7 @@ JPEGDEC jpeg;
 uint8_t* imgBitmap = nullptr;
 int imgDecodedWidth = 0;
 int imgHeight = 0;
-int imgOffsetX = 0;
+int imgBytesPerRow = 0;  // байт на строку bitmap (зависит от decoded ширины)
 
 // Bayer 4×4 матрица дизеринга (упорядоченный дизеринг)
 const uint8_t bayer4x4[4][4] = {
@@ -304,9 +304,8 @@ int jpegDrawCallback(JPEGDRAW *pDraw) {
 
             if (gray < threshold) {
                 // Чёрная точка
-                int bx = srcX + imgOffsetX;
-                int byteIdx = srcY * IMG_BYTES_ROW + bx / 8;
-                imgBitmap[byteIdx] |= (1 << (7 - (bx & 7)));
+                int byteIdx = srcY * imgBytesPerRow + srcX / 8;
+                imgBitmap[byteIdx] |= (1 << (7 - (srcX & 7)));
             }
         }
     }
@@ -481,9 +480,9 @@ bool decodeAndPrintJpeg(uint8_t* jpegData, size_t jpegSize) {
 
         imgDecodedWidth = min(origW / divisor, IMG_WIDTH);
         imgHeight = min(origH / divisor, IMG_MAX_HEIGHT);
-        imgOffsetX = max((IMG_WIDTH - imgDecodedWidth) / 2, 0);
+        imgBytesPerRow = (imgDecodedWidth + 7) / 8;
 
-        size_t bitmapSize = (size_t)IMG_BYTES_ROW * imgHeight;
+        size_t bitmapSize = (size_t)imgBytesPerRow * imgHeight;
 
         // Пробуем PSRAM, затем обычную RAM
         imgBitmap = (uint8_t*)heap_caps_calloc(1, bitmapSize, MALLOC_CAP_SPIRAM);
@@ -515,7 +514,7 @@ bool decodeAndPrintJpeg(uint8_t* jpegData, size_t jpegSize) {
     // Печатаем
     Serial.printf("Печать... free RAM: %d\n", ESP.getFreeHeap());
     setupCyrillic();
-    printRasterImage(imgBitmap, imgHeight);
+    printRasterImage(imgBitmap, imgDecodedWidth, imgHeight);
     feedDots(80);
     partialCut();
 
@@ -527,11 +526,22 @@ bool decodeAndPrintJpeg(uint8_t* jpegData, size_t jpegSize) {
 }
 
 // Печать растрового изображения через ESC * 33 (24-dot double density)
-void printRasterImage(uint8_t* bitmap, int height) {
+// bmpWidth — реальная ширина декодированного изображения (может быть < 576)
+// При bmpWidth < IMG_WIDTH — nearest-neighbor масштабирование до полной ширины
+void printRasterImage(uint8_t* bitmap, int bmpWidth, int bmpHeight) {
+    int bmpBytesPerRow = (bmpWidth + 7) / 8;
+
+    // Высота на выходе с учётом масштабирования (сохраняем пропорции)
+    int outHeight = (bmpWidth < IMG_WIDTH)
+                    ? (int)((long)bmpHeight * IMG_WIDTH / bmpWidth)
+                    : bmpHeight;
+
+    Serial.printf("Print: bmp %dx%d → out %dx%d\n", bmpWidth, bmpHeight, IMG_WIDTH, outHeight);
+
     // Устанавливаем межстрочный интервал = 24 точки (чтобы полосы стыковались)
     sendCommand(0x1B, 0x33, 24);  // ESC 3 n
 
-    for (int stripY = 0; stripY < height; stripY += 24) {
+    for (int stripY = 0; stripY < outHeight; stripY += 24) {
         // ESC * 33 nL nH — 24-dot double density bit image
         Serial2.write(0x1B);
         Serial2.write(0x2A);      // '*'
@@ -540,15 +550,26 @@ void printRasterImage(uint8_t* bitmap, int height) {
         Serial2.write((uint8_t)((IMG_WIDTH >> 8) & 0xFF));  // nH
 
         // Для каждого столбца: 3 байта (24 вертикальные точки)
-        for (int x = 0; x < IMG_WIDTH; x++) {
+        for (int outX = 0; outX < IMG_WIDTH; outX++) {
+            // Nearest-neighbor: откуда брать пиксель по X
+            int srcX = (bmpWidth < IMG_WIDTH)
+                        ? (int)((long)outX * bmpWidth / IMG_WIDTH)
+                        : outX;
+
             for (int byteNum = 0; byteNum < 3; byteNum++) {
                 uint8_t val = 0;
                 for (int bit = 0; bit < 8; bit++) {
-                    int y = stripY + byteNum * 8 + bit;
-                    if (y < height) {
-                        int byteIdx = y * IMG_BYTES_ROW + x / 8;
-                        if (bitmap[byteIdx] & (1 << (7 - (x & 7)))) {
-                            val |= (1 << (7 - bit));
+                    int outY = stripY + byteNum * 8 + bit;
+                    if (outY < outHeight) {
+                        // Nearest-neighbor: откуда брать пиксель по Y
+                        int srcY = (bmpWidth < IMG_WIDTH)
+                                    ? (int)((long)outY * bmpHeight / outHeight)
+                                    : outY;
+                        if (srcY < bmpHeight && srcX < bmpWidth) {
+                            int byteIdx = srcY * bmpBytesPerRow + srcX / 8;
+                            if (bitmap[byteIdx] & (1 << (7 - (srcX & 7)))) {
+                                val |= (1 << (7 - bit));
+                            }
                         }
                     }
                 }
@@ -556,7 +577,7 @@ void printRasterImage(uint8_t* bitmap, int height) {
             }
 
             // Сбрасываем буфер каждые 64 столбца
-            if ((x & 63) == 63) Serial2.flush();
+            if ((outX & 63) == 63) Serial2.flush();
         }
 
         Serial2.write(0x0A);  // LF — переход на следующую полосу
