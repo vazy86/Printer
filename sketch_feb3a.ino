@@ -436,7 +436,7 @@ void frameTest() {
 
     setupCyrillic();
 
-    const uint8_t lineWidth = 32;
+    const uint8_t lineWidth = 48;  // Font A: 48 символов на строку (576 точек / 12)
     String topBottom = "";
     for (uint8_t i = 0; i < lineWidth; i++) {
         topBottom += "*";
