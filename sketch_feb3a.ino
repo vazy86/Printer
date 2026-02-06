@@ -1,486 +1,732 @@
-// Подключение термопринтера Nippon NP-F309 к ESP32-S3
-// RS232 через MAX3232 + поддержка кириллицы CP1251
+// Термопринтер Nippon NP-F3092 + ESP32-S3 + Telegram Bot
+// RS232 через MAX3232, кириллица CP1251, WiFi + Telegram
+// Поддержка печати текста и изображений (JPEG → ч/б растр)
 
-#define RXD2 17  // Пин RX для Serial2 (подключен к TX MAX3232)
-#define TXD2 18  // Пин TX для Serial2 (подключен к RX MAX3232)
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <JPEGDEC.h>
+
+// ========== НАСТРОЙКИ — ИЗМЕНИ ПОД СЕБЯ ==========
+
+const char* WIFI_SSID     = "ТВОЙ_WIFI";        // Имя WiFi сети
+const char* WIFI_PASSWORD = "ТВОЙ_ПАРОЛЬ";       // Пароль WiFi
+const char* BOT_TOKEN     = "ТВОЙ_ТОКЕН_БОТА";   // Токен от @BotFather
+
+// =================================================
+
+#define RXD2 17
+#define TXD2 18
+
+// Telegram
+long lastUpdateId = 0;
+unsigned long lastPollTime = 0;
+const unsigned long POLL_INTERVAL = 2000;
+
+// Глобальный TLS-клиент (экономим память, не создаём каждый раз)
+WiFiClientSecure secureClient;
+
+// Изображения
+#define IMG_WIDTH       576
+#define IMG_BYTES_ROW   72    // 576 / 8
+#define IMG_MAX_HEIGHT  500
+#define MAX_JPEG_SIZE   100000
+
+JPEGDEC jpeg;
+uint8_t* imgBitmap = nullptr;
+int imgDecodedWidth = 0;
+int imgHeight = 0;
+int imgOffsetX = 0;
+
+// Bayer 4×4 матрица дизеринга (упорядоченный дизеринг)
+const uint8_t bayer4x4[4][4] = {
+    {  0, 128,  32, 160},
+    {192,  64, 224,  96},
+    { 48, 176,  16, 144},
+    {240, 112, 208,  80}
+};
+
+// ========== SETUP / LOOP ==========
 
 void setup() {
-    // Инициализация Serial для отладки
     Serial.begin(115200);
     delay(1000);
     Serial.println("Инициализация принтера...");
-    
-    // Инициализация Serial2 для принтера
-    // 9600 baud, 8 data bits, No parity, 1 stop bit
-    Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
 
-    // Увеличение буферов UART для надежности
+    Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
     Serial2.setRxBufferSize(1024);
     Serial2.setTxBufferSize(1024);
-    
     delay(500);
-    
-    // Настройка кириллицы
+
     setupCyrillic();
-    
+
+    // TLS без проверки сертификата (для Telegram API)
+    secureClient.setInsecure();
+
+    connectWiFi();
+
     Serial.println("Принтер готов!");
-    Serial.println("Команды:");
-    Serial.println("  t - полный тест");
-    Serial.println("  s - короткий тест");
-    Serial.println("  a - расширенный тест (чек на русском)");
-    Serial.println("  r - тест кириллицы");
-    Serial.println("  b - тест штрихкода и QR");
-    Serial.println("  f - рамка из * с текстом ТЕСТОВОЕ");
+    Serial.println("Команды Serial Monitor:");
+    Serial.println("  t - полный тест    s - короткий тест");
+    Serial.println("  a - чек на русском r - тест кириллицы");
+    Serial.println("  b - штрихкод/QR    f - рамка");
+    Serial.println("Telegram: текст → печать, фото → печать картинки");
 }
 
 void loop() {
-    // Ожидание команд через Serial Monitor
     if (Serial.available()) {
         char cmd = Serial.read();
-        
         switch(cmd) {
-            case 't':
-                testPrint();
-                break;
-            case 's':
-                shortTest();
-                break;
-            case 'a':
-                advancedTest();
-                break;
-            case 'r':
-                cyrillicTest();
-                break;
-            case 'b':
-                barcodeQRTest();
-                break;
-            case 'f':
-                frameTest();
-                break;
-            default:
-                Serial.println("Неизвестная команда");
+            case 't': testPrint(); break;
+            case 's': shortTest(); break;
+            case 'a': advancedTest(); break;
+            case 'r': cyrillicTest(); break;
+            case 'b': barcodeQRTest(); break;
+            case 'f': frameTest(); break;
+        }
+    }
+
+    if (millis() - lastPollTime >= POLL_INTERVAL) {
+        lastPollTime = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi потерян, переподключаюсь...");
+            connectWiFi();
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            checkTelegram();
         }
     }
 }
 
-// ========== НАСТРОЙКА КИРИЛЛИЦЫ ==========
+// ========== WiFi ==========
 
-void setupCyrillic() {
-    Serial.println("Настройка кириллицы CP1251...");
-    
-    // Инициализация принтера
-    printerInit();  // ESC @
-    delay(200);
-    
-    // Выбор кодовой таблицы CP1251 (кириллица)
-    // ESC t n, где n=04 это CP1251
-    selectCodepage(0x04);
-    
-    Serial.println("CP1251 активирована!");
+void connectWiFi() {
+    Serial.print("Подключение к WiFi: ");
+    Serial.println(WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("\nWiFi подключен! IP: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nWiFi не подключен.");
+    }
 }
 
-// ========== ТАБЛИЦА ПЕРЕКОДИРОВКИ UTF-8 -> CP1251 ==========
+// ========== TELEGRAM BOT ==========
 
-// Преобразование UTF-8 символа в CP1251
+void checkTelegram() {
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot";
+    url += BOT_TOKEN;
+    url += "/getUpdates?limit=5&timeout=0";
+    if (lastUpdateId > 0) {
+        url += "&offset=";
+        url += String(lastUpdateId + 1);
+    }
+
+    http.begin(secureClient, url);
+    http.setTimeout(5000);
+    int code = http.GET();
+    if (code == 200) {
+        parseMessages(http.getString());
+    }
+    http.end();
+}
+
+void parseMessages(String payload) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return;
+    if (!doc["ok"].as<bool>()) return;
+
+    for (JsonObject update : doc["result"].as<JsonArray>()) {
+        lastUpdateId = update["update_id"].as<long>();
+        JsonObject message = update["message"];
+        if (message.isNull()) continue;
+
+        long chatId = message["chat"]["id"].as<long>();
+        const char* firstName = message["from"]["first_name"];
+
+        // Фото?
+        if (!message["photo"].isNull()) {
+            Serial.println("Получено фото из Telegram");
+            handlePhoto(message, chatId);
+            continue;
+        }
+
+        // Текст?
+        const char* text = message["text"];
+        if (!text) continue;
+
+        Serial.printf("Telegram от %s: %s\n", firstName ? firstName : "???", text);
+        String msg = String(text);
+
+        if (msg == "/start") {
+            sendTelegramMessage(chatId,
+                "Привет! Я бот-принтер.\n"
+                "Отправь текст — распечатаю.\n"
+                "Отправь фото — тоже распечатаю!\n\n"
+                "Команды:\n"
+                "/status - статус принтера\n"
+                "/cut - отрезать бумагу\n"
+                "/test - тестовая печать");
+        }
+        else if (msg == "/status") {
+            String s = "Принтер онлайн\nWiFi: " + WiFi.SSID()
+                     + "\nIP: " + WiFi.localIP().toString()
+                     + "\nСигнал: " + String(WiFi.RSSI()) + " dBm"
+                     + "\nСвободно RAM: " + String(ESP.getFreeHeap() / 1024) + " KB";
+            sendTelegramMessage(chatId, s);
+        }
+        else if (msg == "/cut") {
+            feedDots(80);
+            partialCut();
+            sendTelegramMessage(chatId, "Бумага отрезана!");
+        }
+        else if (msg == "/test") {
+            shortTest();
+            sendTelegramMessage(chatId, "Тестовая печать выполнена!");
+        }
+        else {
+            printTelegramMessage(firstName, msg);
+            sendTelegramMessage(chatId, "Напечатано!");
+        }
+    }
+}
+
+void printTelegramMessage(const char* from, String text) {
+    setupCyrillic();
+    setAlignment(1);
+    printCyrillicLine("--- TELEGRAM ---");
+    setAlignment(0);
+
+    if (from) {
+        String fromLine = "От: ";
+        fromLine += from;
+        printCyrillicLine(fromLine);
+    }
+    printCyrillicLine("------------------------------------------------");
+    printWrappedText(text);
+    printCyrillicLine("------------------------------------------------");
+
+    feedDots(80);
+    partialCut();
+}
+
+void printWrappedText(String text) {
+    int charCount = 0;
+    String line = "";
+    int i = 0;
+
+    while (i < (int)text.length()) {
+        uint8_t c = text[i];
+        if (c == '\n') {
+            printCyrillicLine(line);
+            line = "";
+            charCount = 0;
+            i++;
+            continue;
+        }
+
+        int charBytes = 1;
+        if ((c & 0xE0) == 0xC0) charBytes = 2;
+        else if ((c & 0xF0) == 0xE0) charBytes = 3;
+        else if ((c & 0xF8) == 0xF0) charBytes = 4;
+
+        if (charCount >= 48) {
+            printCyrillicLine(line);
+            line = "";
+            charCount = 0;
+        }
+
+        for (int j = 0; j < charBytes && (i + j) < (int)text.length(); j++) {
+            line += (char)text[i + j];
+        }
+        charCount++;
+        i += charBytes;
+    }
+    if (line.length() > 0) printCyrillicLine(line);
+}
+
+void sendTelegramMessage(long chatId, String text) {
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot";
+    url += BOT_TOKEN;
+    url += "/sendMessage";
+
+    String body = "{\"chat_id\":";
+    body += String(chatId);
+    body += ",\"text\":\"";
+    for (int i = 0; i < (int)text.length(); i++) {
+        char c = text[i];
+        if (c == '"') body += "\\\"";
+        else if (c == '\n') body += "\\n";
+        else if (c == '\\') body += "\\\\";
+        else body += c;
+    }
+    body += "\"}";
+
+    http.begin(secureClient, url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(5000);
+    http.POST(body);
+    http.end();
+}
+
+// ========== ПЕЧАТЬ ИЗОБРАЖЕНИЙ ==========
+
+// Callback для JPEGDEC — вызывается для каждого блока MCU
+int jpegDrawCallback(JPEGDRAW *pDraw) {
+    for (int j = 0; j < pDraw->iHeight; j++) {
+        for (int i = 0; i < pDraw->iWidth; i++) {
+            int srcX = pDraw->x + i;
+            int srcY = pDraw->y + j;
+            if (srcX >= imgDecodedWidth || srcY >= imgHeight) continue;
+
+            uint16_t pixel = pDraw->pPixels[j * pDraw->iWidth + i];
+
+            // RGB565 → оттенки серого
+            uint8_t r = ((pixel >> 11) & 0x1F) << 3;
+            uint8_t g = ((pixel >> 5) & 0x3F) << 2;
+            uint8_t b = (pixel & 0x1F) << 3;
+            uint8_t gray = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
+
+            // Упорядоченный дизеринг Bayer 4×4
+            uint8_t threshold = bayer4x4[srcY & 3][srcX & 3];
+
+            if (gray < threshold) {
+                // Чёрная точка
+                int bx = srcX + imgOffsetX;
+                int byteIdx = srcY * IMG_BYTES_ROW + bx / 8;
+                imgBitmap[byteIdx] |= (1 << (7 - (bx & 7)));
+            }
+        }
+    }
+    return 1;
+}
+
+void handlePhoto(JsonObject message, long chatId) {
+    JsonArray photos = message["photo"].as<JsonArray>();
+    if (photos.size() == 0) return;
+
+    // Выбираем фото ближайшее к 576px по ширине (но не меньше)
+    const char* bestId = nullptr;
+    int bestW = 0;
+
+    for (JsonObject p : photos) {
+        int w = p["width"].as<int>();
+        if (w >= IMG_WIDTH && (bestW == 0 || w < bestW)) {
+            bestW = w;
+            bestId = p["file_id"];
+        }
+    }
+    // Если нет >= 576, берём самое большое
+    if (!bestId) {
+        for (JsonObject p : photos) {
+            int w = p["width"].as<int>();
+            if (w > bestW) {
+                bestW = w;
+                bestId = p["file_id"];
+            }
+        }
+    }
+
+    if (!bestId) {
+        sendTelegramMessage(chatId, "Ошибка: не удалось получить фото");
+        return;
+    }
+
+    // Получаем путь к файлу через Telegram API
+    String filePath = getTelegramFilePath(bestId);
+    if (filePath.length() == 0) {
+        sendTelegramMessage(chatId, "Ошибка: getFile не удался");
+        return;
+    }
+
+    String fileUrl = "https://api.telegram.org/file/bot";
+    fileUrl += BOT_TOKEN;
+    fileUrl += "/";
+    fileUrl += filePath;
+
+    Serial.print("Скачиваю: ");
+    Serial.println(fileUrl);
+    sendTelegramMessage(chatId, "Скачиваю и печатаю фото...");
+
+    // Скачиваем JPEG
+    size_t jpegSize = 0;
+    uint8_t* jpegData = downloadFile(fileUrl, &jpegSize);
+
+    if (!jpegData) {
+        sendTelegramMessage(chatId, "Ошибка: не удалось скачать фото");
+        return;
+    }
+
+    Serial.printf("JPEG: %d байт\n", jpegSize);
+
+    // Декодируем и печатаем
+    bool ok = decodeAndPrintJpeg(jpegData, jpegSize);
+    free(jpegData);
+
+    sendTelegramMessage(chatId, ok ? "Фото напечатано!" : "Ошибка печати фото");
+}
+
+String getTelegramFilePath(const char* fileId) {
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot";
+    url += BOT_TOKEN;
+    url += "/getFile?file_id=";
+    url += fileId;
+
+    http.begin(secureClient, url);
+    http.setTimeout(10000);
+    int code = http.GET();
+
+    String path = "";
+    if (code == 200) {
+        JsonDocument doc;
+        if (!deserializeJson(doc, http.getString())) {
+            if (doc["ok"].as<bool>()) {
+                path = doc["result"]["file_path"].as<String>();
+            }
+        }
+    }
+    http.end();
+    return path;
+}
+
+uint8_t* downloadFile(String url, size_t* outSize) {
+    HTTPClient http;
+    http.begin(secureClient, url);
+    http.setTimeout(15000);
+    int code = http.GET();
+
+    if (code != 200) {
+        Serial.printf("Download HTTP error: %d\n", code);
+        http.end();
+        return nullptr;
+    }
+
+    int len = http.getSize();
+    if (len <= 0 || len > MAX_JPEG_SIZE) {
+        Serial.printf("Bad file size: %d\n", len);
+        http.end();
+        return nullptr;
+    }
+
+    uint8_t* buf = (uint8_t*)malloc(len);
+    if (!buf) {
+        Serial.println("malloc failed (JPEG)");
+        http.end();
+        return nullptr;
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    int bytesRead = 0;
+    unsigned long deadline = millis() + 15000;
+
+    while (bytesRead < len && millis() < deadline) {
+        if (stream->available()) {
+            int n = stream->readBytes(buf + bytesRead,
+                                      min((int)stream->available(), len - bytesRead));
+            bytesRead += n;
+        }
+        delay(1);
+    }
+    http.end();
+
+    if (bytesRead != len) {
+        Serial.printf("Incomplete: %d / %d\n", bytesRead, len);
+        free(buf);
+        return nullptr;
+    }
+
+    *outSize = bytesRead;
+    return buf;
+}
+
+bool decodeAndPrintJpeg(uint8_t* jpegData, size_t jpegSize) {
+    if (!jpeg.openRAM(jpegData, jpegSize, jpegDrawCallback)) {
+        Serial.println("JPEG open failed");
+        return false;
+    }
+
+    int origW = jpeg.getWidth();
+    int origH = jpeg.getHeight();
+    Serial.printf("JPEG: %dx%d\n", origW, origH);
+
+    // Масштаб: выбираем ближайший к 576px
+    int scale = 0;
+    if (origW > 4608)      scale = JPEG_SCALE_EIGHTH;   // /8
+    else if (origW > 2304) scale = JPEG_SCALE_QUARTER;  // /4
+    else if (origW > 1152) scale = JPEG_SCALE_HALF;     // /2
+
+    int divisor = scale ? scale : 1;
+    imgDecodedWidth = origW / divisor;
+    imgHeight = origH / divisor;
+
+    if (imgDecodedWidth > IMG_WIDTH) imgDecodedWidth = IMG_WIDTH;
+    if (imgHeight > IMG_MAX_HEIGHT) imgHeight = IMG_MAX_HEIGHT;
+
+    // Центрируем если уже 576
+    imgOffsetX = (IMG_WIDTH - imgDecodedWidth) / 2;
+    if (imgOffsetX < 0) imgOffsetX = 0;
+
+    // Выделяем bitmap (calloc = заполнен нулями = белый)
+    size_t bitmapSize = (size_t)IMG_BYTES_ROW * imgHeight;
+    imgBitmap = (uint8_t*)calloc(1, bitmapSize);
+    if (!imgBitmap) {
+        Serial.printf("malloc failed (bitmap %d bytes)\n", bitmapSize);
+        jpeg.close();
+        return false;
+    }
+
+    Serial.printf("Decode: scale=1/%d, size=%dx%d, offset=%d\n",
+                  divisor, imgDecodedWidth, imgHeight, imgOffsetX);
+
+    jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+    jpeg.decode(0, 0, scale);
+    jpeg.close();
+
+    // Печатаем
+    setupCyrillic();
+    printRasterImage(imgBitmap, imgHeight);
+    feedDots(80);
+    partialCut();
+
+    free(imgBitmap);
+    imgBitmap = nullptr;
+
+    Serial.println("Изображение напечатано!");
+    return true;
+}
+
+// Печать растрового изображения через ESC * 33 (24-dot double density)
+void printRasterImage(uint8_t* bitmap, int height) {
+    // Устанавливаем межстрочный интервал = 24 точки (чтобы полосы стыковались)
+    sendCommand(0x1B, 0x33, 24);  // ESC 3 n
+
+    for (int stripY = 0; stripY < height; stripY += 24) {
+        // ESC * 33 nL nH — 24-dot double density bit image
+        Serial2.write(0x1B);
+        Serial2.write(0x2A);      // '*'
+        Serial2.write((uint8_t)33);
+        Serial2.write((uint8_t)(IMG_WIDTH & 0xFF));         // nL
+        Serial2.write((uint8_t)((IMG_WIDTH >> 8) & 0xFF));  // nH
+
+        // Для каждого столбца: 3 байта (24 вертикальные точки)
+        for (int x = 0; x < IMG_WIDTH; x++) {
+            for (int byteNum = 0; byteNum < 3; byteNum++) {
+                uint8_t val = 0;
+                for (int bit = 0; bit < 8; bit++) {
+                    int y = stripY + byteNum * 8 + bit;
+                    if (y < height) {
+                        int byteIdx = y * IMG_BYTES_ROW + x / 8;
+                        if (bitmap[byteIdx] & (1 << (7 - (x & 7)))) {
+                            val |= (1 << (7 - bit));
+                        }
+                    }
+                }
+                Serial2.write(val);
+            }
+
+            // Сбрасываем буфер каждые 64 столбца
+            if ((x & 63) == 63) Serial2.flush();
+        }
+
+        Serial2.write(0x0A);  // LF — переход на следующую полосу
+        Serial2.flush();
+        delay(10);
+    }
+
+    // Восстанавливаем межстрочный интервал по умолчанию
+    sendCommand(0x1B, 0x32);  // ESC 2
+}
+
+// ========== КИРИЛЛИЦА ==========
+
+void setupCyrillic() {
+    printerInit();
+    delay(200);
+    selectCodepage(0x04);
+}
+
 uint8_t utf8ToCp1251(uint16_t utf8Code) {
-    // Таблица соответствия UTF-8 -> CP1251 для кириллицы
-    // UTF-8 кириллица: 0x0410-0x044F
-    // CP1251 кириллица: 0xC0-0xFF
-    
-    if (utf8Code >= 0x0410 && utf8Code <= 0x042F) {
-        // Заглавные буквы А-Я (0x0410-0x042F -> 0xC0-0xDF)
+    if (utf8Code >= 0x0410 && utf8Code <= 0x042F)
         return 0xC0 + (utf8Code - 0x0410);
-    }
-    else if (utf8Code >= 0x0430 && utf8Code <= 0x044F) {
-        // Строчные буквы а-я (0x0430-0x044F -> 0xE0-0xFF)
+    if (utf8Code >= 0x0430 && utf8Code <= 0x044F)
         return 0xE0 + (utf8Code - 0x0430);
-    }
-    else if (utf8Code == 0x0401) {
-        // Ё заглавная
-        return 0xA8;
-    }
-    else if (utf8Code == 0x0451) {
-        // ё строчная
-        return 0xB8;
-    }
-    
-    // Если не кириллица, возвращаем как есть (ASCII)
+    if (utf8Code == 0x0401) return 0xA8;
+    if (utf8Code == 0x0451) return 0xB8;
     return utf8Code & 0xFF;
 }
 
-// Печать строки с поддержкой кириллицы
 void printCyrillicLine(String text) {
     int i = 0;
-    while (i < text.length()) {
+    while (i < (int)text.length()) {
         uint8_t c = text[i];
-        
-        // Проверка на UTF-8 многобайтовый символ
         if ((c & 0x80) == 0) {
-            // ASCII символ (0x00-0x7F)
             Serial2.write(c);
             i++;
         }
-        else if ((c & 0xE0) == 0xC0) {
-            // 2-байтовый UTF-8 символ (110xxxxx 10xxxxxx)
-            if (i + 1 < text.length()) {
-                uint8_t c2 = text[i + 1];
-                uint16_t utf8Code = ((c & 0x1F) << 6) | (c2 & 0x3F);
-                uint8_t cp1251 = utf8ToCp1251(utf8Code);
-                Serial2.write(cp1251);
-                i += 2;
-            } else {
-                i++;
-            }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < (int)text.length()) {
+            uint16_t code = ((c & 0x1F) << 6) | (text[i+1] & 0x3F);
+            Serial2.write(utf8ToCp1251(code));
+            i += 2;
         }
-        else if ((c & 0xF0) == 0xE0) {
-            // 3-байтовый UTF-8 символ (1110xxxx 10xxxxxx 10xxxxxx)
-            if (i + 2 < text.length()) {
-                uint8_t c2 = text[i + 1];
-                uint8_t c3 = text[i + 2];
-                uint16_t utf8Code = ((c & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F);
-                uint8_t cp1251 = utf8ToCp1251(utf8Code);
-                Serial2.write(cp1251);
-                i += 3;
-            } else {
-                i++;
-            }
+        else if ((c & 0xF0) == 0xE0 && i + 2 < (int)text.length()) {
+            uint16_t code = ((c & 0x0F) << 12) | ((text[i+1] & 0x3F) << 6) | (text[i+2] & 0x3F);
+            Serial2.write(utf8ToCp1251(code));
+            i += 3;
         }
-        else {
-            // Неизвестный формат, пропускаем
-            i++;
-        }
+        else i++;
     }
-    
-    // Перевод строки
-    Serial2.write(0x0A);  // Line Feed
-    Serial2.flush();
-    delay(100);
-}
-
-// ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-
-// Отправка команды из 2 байт
-void sendCommand(uint8_t cmd1, uint8_t cmd2) {
-    Serial2.write(cmd1);
-    Serial2.write(cmd2);
-    Serial2.flush();
-    delay(50);
-}
-
-// Отправка команды из 3 байт
-void sendCommand(uint8_t cmd1, uint8_t cmd2, uint8_t cmd3) {
-    Serial2.write(cmd1);
-    Serial2.write(cmd2);
-    Serial2.write(cmd3);
-    Serial2.flush();
-    delay(50);
-}
-
-// Печать строки текста БЕЗ кириллицы (только ASCII)
-void printLine(String text) {
-    Serial2.print(text);
     Serial2.write(0x0A);
     Serial2.flush();
     delay(100);
 }
 
-// ========== БАЗОВЫЕ ESC/POS-КОМАНДЫ ==========
+// ========== ВСПОМОГАТЕЛЬНЫЕ ==========
 
-void printerInit() {
-    sendCommand(0x1B, 0x40);  // ESC @
+void sendCommand(uint8_t c1, uint8_t c2) {
+    Serial2.write(c1); Serial2.write(c2);
+    Serial2.flush(); delay(50);
+}
+void sendCommand(uint8_t c1, uint8_t c2, uint8_t c3) {
+    Serial2.write(c1); Serial2.write(c2); Serial2.write(c3);
+    Serial2.flush(); delay(50);
+}
+void printLine(String text) {
+    Serial2.print(text); Serial2.write(0x0A);
+    Serial2.flush(); delay(100);
 }
 
-void selectCodepage(uint8_t codepage) {
-    sendCommand(0x1B, 0x74, codepage);  // ESC t n
-}
+// ========== ESC/POS ==========
+
+void printerInit()   { sendCommand(0x1B, 0x40); }
+void selectCodepage(uint8_t cp) { sendCommand(0x1B, 0x74, cp); }
+void setAlignment(uint8_t a)    { sendCommand(0x1B, 0x61, a); }
+void setBold(bool on)           { sendCommand(0x1B, 0x45, on ? 1 : 0); }
 
 void feedDots(uint8_t dots) {
-    sendCommand(0x1B, 0x4A, dots);  // ESC J n
-    Serial2.flush();
-    delay(300);
+    sendCommand(0x1B, 0x4A, dots);
+    Serial2.flush(); delay(300);
 }
-
 void partialCut() {
-    sendCommand(0x1B, 0x6D);  // ESC m
-    Serial2.flush();
-    delay(600);
+    sendCommand(0x1B, 0x6D);
+    Serial2.flush(); delay(600);
 }
 
-// Выравнивание текста
-void setAlignment(uint8_t align) {
-    // align: 0=left, 1=center, 2=right
-    sendCommand(0x1B, 0x61, align);
-}
+// ========== ТЕСТЫ ==========
 
-// Жирный шрифт
-void setBold(bool enable) {
-    sendCommand(0x1B, 0x45, enable ? 1 : 0);
-}
-
-// ========== ТЕСТОВЫЕ ФУНКЦИИ ==========
-
-// Тест кириллицы с УВЕЛИЧЕННОЙ подачей
 void cyrillicTest() {
-    Serial.println("Тест кириллицы...");
-    
-    setupCyrillic();  // Переключаем на CP1251
-    
-    setAlignment(1);  // Центр
-    setBold(true);
+    setupCyrillic();
+    setAlignment(1); setBold(true);
     printCyrillicLine("ТЕСТ КИРИЛЛИЦЫ");
-    setBold(false);
-    
-    setAlignment(0);  // Влево
-    printCyrillicLine("--------------------------------");
-    printCyrillicLine("Русский алфавит:");
+    setBold(false); setAlignment(0);
     printCyrillicLine("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ");
     printCyrillicLine("абвгдеёжзийклмнопрстуфхцчшщъыьэюя");
-    printCyrillicLine("--------------------------------");
     printCyrillicLine("Цифры: 0123456789");
-    printCyrillicLine("Знаки: !@#$%^&*()_+-=[]{}");
-    printCyrillicLine("--------------------------------");
-    
     setAlignment(1);
     printCyrillicLine("Привет, мир!");
-    printCyrillicLine("Hello, World!");
-    
-    // УВЕЛИЧЕННАЯ ПОДАЧА - 100 точек (~12.5мм)
-    Serial.println("Подача бумаги 100 точек...");
-    feedDots(100);  // 100 точек (~12.5мм)
-    
-    // Частичный отрез
-    Serial.println("Отрезка...");
-    partialCut();
-    
-    Serial.println("Тест кириллицы завершен!");
+    feedDots(100); partialCut();
 }
 
-// Полный тест (английский)
 void testPrint() {
-    Serial.println("Запуск тестовой печати...");
-    
-    printerInit();  // Инициализация
-    delay(200);
-    
-    setAlignment(1);  // Центр
-    setBold(true);
+    printerInit(); delay(200);
+    setAlignment(1); setBold(true);
     printLine("=== PRINTER TEST ===");
-    setBold(false);
-    
-    setAlignment(0);  // Влево
+    setBold(false); setAlignment(0);
     printLine("Nippon NP-F309");
-    printLine("ESP32-S3 + RS232");
+    printLine("ESP32-S3 + RS232 + Telegram");
     printLine("Date: " + String(__DATE__));
     printLine("Time: " + String(__TIME__));
-    
-    setAlignment(1);
-    printLine("====================");
-    
-    // Подача 80 точек
-    feedDots(80);  // 80 точек (~10мм)
-    
-    // Частичный отрез
-    partialCut();
-    
-    Serial.println("Печать завершена!");
+    feedDots(80); partialCut();
 }
 
-// Короткий тест
 void shortTest() {
-    Serial.println("Короткий тест...");
-    
-    printerInit();  // Инициализация
-    delay(200);
-    
+    printerInit(); delay(200);
     printLine("Quick test OK");
-    
-    // Подача 60 точек
-    feedDots(60);  // 60 точек (~7.5мм)
-    
-    // Частичный отрез
-    partialCut();
-    
-    Serial.println("Готово!");
+    feedDots(60); partialCut();
 }
 
-// Расширенный тест с кириллицей и УВЕЛИЧЕННОЙ подачей
 void advancedTest() {
-    Serial.println("Расширенный тест (чек на русском)...");
-    
-    setupCyrillic();  // Включаем кириллицу
-    
-    // Заголовок
-    setAlignment(1);  // Центр
-    setBold(true);
+    setupCyrillic();
+    setAlignment(1); setBold(true);
     printCyrillicLine("МАГАЗИН ЭЛЕКТРОНИКА");
     setBold(false);
     printCyrillicLine("ул. Примерная, д. 123");
     printCyrillicLine("Тел: +7 (123) 456-78-90");
     printCyrillicLine("------------------------");
-    
-    // Товары
-    setAlignment(0);  // Влево
-    printCyrillicLine("Товар             Цена");
-    printCyrillicLine("------------------------");
+    setAlignment(0);
     printCyrillicLine("Arduino UNO      1500 р");
     printCyrillicLine("ESP32-S3          890 р");
     printCyrillicLine("Резистор 10к        5 р");
     printCyrillicLine("Макетка           250 р");
     printCyrillicLine("------------------------");
-    
-    // Итог
     setBold(true);
     printCyrillicLine("ИТОГО:           2645 р");
     setBold(false);
-    
-    printCyrillicLine("------------------------");
-    setAlignment(1);  // Центр
+    setAlignment(1);
     printCyrillicLine("Спасибо за покупку!");
-    printLine(String(__DATE__) + " " + String(__TIME__));
-    
-    // УВЕЛИЧЕННАЯ ПОДАЧА - 100 точек (~12.5мм)
-    Serial.println("Подача бумаги 100 точек...");
-    feedDots(100);  // 100 точек (~12.5мм)
-    
-    // Частичный отрез
-    Serial.println("Отрезка...");
-    partialCut();
-    
-    Serial.println("Чек распечатан!");
+    feedDots(100); partialCut();
 }
 
-// ========== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ==========
-
-// Печать штрих-кода (пример для CODE39)
 void printBarcode(String data) {
-    // Высота штрихкода
-    Serial2.write(0x1D);  // GS
-    Serial2.write(0x68);  // h
-    Serial2.write(100);   // 100 точек высота
-    Serial2.flush();
-    delay(50);
-    
-    // Ширина модуля
-    Serial2.write(0x1D);  // GS
-    Serial2.write(0x77);  // w
-    Serial2.write(3);     // Ширина 3
-    Serial2.flush();
-    delay(50);
-    
-    // Позиция HRI символов (2=снизу)
-    Serial2.write(0x1D);  // GS
-    Serial2.write(0x48);  // H
-    Serial2.write(2);     // Снизу
-    Serial2.flush();
-    delay(50);
-    
-    // Печать штрихкода CODE39
-    Serial2.write(0x1D);  // GS
-    Serial2.write(0x6B);  // k
-    Serial2.write(0x04);  // m = CODE39
-    
-    // Данные (должны начинаться и заканчиваться на *)
+    Serial2.write(0x1D); Serial2.write(0x68); Serial2.write(100);
+    Serial2.flush(); delay(50);
+    Serial2.write(0x1D); Serial2.write(0x77); Serial2.write(3);
+    Serial2.flush(); delay(50);
+    Serial2.write(0x1D); Serial2.write(0x48); Serial2.write(2);
+    Serial2.flush(); delay(50);
+    Serial2.write(0x1D); Serial2.write(0x6B); Serial2.write(0x04);
     Serial2.print("*" + data + "*");
-    Serial2.write(0x00);  // NUL - конец данных
-    Serial2.flush();
-    delay(500);
+    Serial2.write(0x00);
+    Serial2.flush(); delay(500);
 }
 
-// Печать QR-кода
 void printQRCode(String data) {
-    Serial2.write(0x1B);  // ESC
-    Serial2.write(0x71);  // q
-    Serial2.write(4);     // S - размер модуля (4 точки)
-    Serial2.write(0);     // E - уровень коррекции (0=L)
-    Serial2.write(0);     // V - версия (0=авто)
-    Serial2.write(0);     // M - маска (0=оптимальная)
-    
-    // Длина данных (n1 + n2*256)
+    Serial2.write(0x1B); Serial2.write(0x71);
+    Serial2.write(4); Serial2.write(0); Serial2.write(0); Serial2.write(0);
     uint16_t len = data.length();
-    Serial2.write(len & 0xFF);        // n1
-    Serial2.write((len >> 8) & 0xFF); // n2
-    
-    // Данные
+    Serial2.write(len & 0xFF); Serial2.write((len >> 8) & 0xFF);
     Serial2.print(data);
-    Serial2.flush();
-    delay(1000);  // QR-коду нужно больше времени
+    Serial2.flush(); delay(1000);
 }
 
-// Пример использования штрихкода и QR-кода
 void barcodeQRTest() {
-    Serial.println("Тест штрихкода и QR...");
-    
     setupCyrillic();
-    
     setAlignment(1);
     printCyrillicLine("Штрихкод CODE39:");
     setAlignment(0);
-    printBarcode("123456789");  // Печать штрихкода
-    
+    printBarcode("123456789");
     setAlignment(1);
-    printCyrillicLine("");
     printCyrillicLine("QR код:");
-    printQRCode("https://github.com");  // Печать QR
-    
-    // Подача и отрез
-    feedDots(100);
-    partialCut();
-    
-    Serial.println("Готово!");
+    printQRCode("https://github.com");
+    feedDots(100); partialCut();
 }
 
-
-// Режим печати квадратной рамки из символа *
 void frameTest() {
-    Serial.println("Печать рамки из *...");
-
     setupCyrillic();
+    const uint8_t W = 48;
+    String top = ""; for (uint8_t i=0;i<W;i++) top += "*";
+    String mid = "*"; for (uint8_t i=0;i<W-2;i++) mid += " "; mid += "*";
 
-    const uint8_t lineWidth = 48;  // Font A: 48 символов на строку (576 точек / 12)
-    String topBottom = "";
-    for (uint8_t i = 0; i < lineWidth; i++) {
-        topBottom += "*";
-    }
-
-    String middle = "*";
-    for (uint8_t i = 0; i < lineWidth - 2; i++) {
-        middle += " ";
-    }
-    middle += "*";
-
-    // Строка с текстом в режиме двойной ширины+высоты+жирный
-    // ESC ! n: bit3=жирный, bit4=двойная высота, bit5=двойная ширина = 0x38
-    // При двойной ширине на строку помещается 24 символа
-    const uint8_t dwLineWidth = 24;
-    String text = "ТЕСТОВОЕ";
-    uint8_t textLen = 8;
-    String textLine = "*";
-    uint8_t innerWidth = dwLineWidth - 2;  // 22
-    uint8_t leftPad = (innerWidth - textLen) / 2;   // 7
-    uint8_t rightPad = innerWidth - textLen - leftPad;
-    for (uint8_t i = 0; i < leftPad; i++) textLine += " ";
-    textLine += text;
-    for (uint8_t i = 0; i < rightPad; i++) textLine += " ";
-    textLine += "*";
-
-    printCyrillicLine(topBottom);
-    for (uint8_t i = 0; i < 3; i++) {
-        printCyrillicLine(middle);
-    }
-
-    // Включаем двойную ширину + двойную высоту + жирный
+    printCyrillicLine(top);
+    for (uint8_t i=0;i<3;i++) printCyrillicLine(mid);
+    setAlignment(1);
     sendCommand(0x1B, 0x21, 0x38);
-    printCyrillicLine(textLine);
-    // Возврат к обычному режиму
+    printCyrillicLine("ТЕСТОВОЕ");
     sendCommand(0x1B, 0x21, 0x00);
-
-    for (uint8_t i = 0; i < 3; i++) {
-        printCyrillicLine(middle);
-    }
-    printCyrillicLine(topBottom);
-
-    feedDots(100);
-    partialCut();
-
-    Serial.println("Рамка распечатана!");
+    setAlignment(0);
+    for (uint8_t i=0;i<3;i++) printCyrillicLine(mid);
+    printCyrillicLine(top);
+    feedDots(100); partialCut();
 }
