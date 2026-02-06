@@ -30,8 +30,8 @@ WiFiClientSecure secureClient;
 // Изображения
 #define IMG_WIDTH       576
 #define IMG_BYTES_ROW   72    // 576 / 8
-#define IMG_MAX_HEIGHT  500
-#define MAX_JPEG_SIZE   100000
+#define IMG_MAX_HEIGHT  1200
+#define MAX_JPEG_SIZE   150000
 
 JPEGDEC jpeg;
 uint8_t* imgBitmap = nullptr;
@@ -371,9 +371,8 @@ void handlePhoto(JsonObject message, long chatId) {
 
     Serial.printf("JPEG: %d байт\n", jpegSize);
 
-    // Декодируем и печатаем
+    // Декодируем и печатаем (jpegData освобождается внутри)
     bool ok = decodeAndPrintJpeg(jpegData, jpegSize);
-    free(jpegData);
 
     sendTelegramMessage(chatId, ok ? "Фото напечатано!" : "Ошибка печати фото");
 }
@@ -452,50 +451,69 @@ uint8_t* downloadFile(String url, size_t* outSize) {
     return buf;
 }
 
+// jpegData освобождается ВНУТРИ этой функции (после декодирования, до печати)
 bool decodeAndPrintJpeg(uint8_t* jpegData, size_t jpegSize) {
     if (!jpeg.openRAM(jpegData, jpegSize, jpegDrawCallback)) {
         Serial.println("JPEG open failed");
+        free(jpegData);
         return false;
     }
 
     int origW = jpeg.getWidth();
     int origH = jpeg.getHeight();
-    Serial.printf("JPEG: %dx%d\n", origW, origH);
+    Serial.printf("JPEG: %dx%d, free RAM: %d\n", origW, origH, ESP.getFreeHeap());
 
-    // Масштаб: выбираем ближайший к 576px
+    // Пробуем масштабы от полного до 1/8, пока bitmap влезет в память
+    int scaleOptions[] = {0, JPEG_SCALE_HALF, JPEG_SCALE_QUARTER, JPEG_SCALE_EIGHTH};
+
+    // Начинаем с предпочтительного масштаба по ширине
+    int startIdx = 0;
+    if (origW > 4608) startIdx = 3;
+    else if (origW > 2304) startIdx = 2;
+    else if (origW > 1152) startIdx = 1;
+
     int scale = 0;
-    if (origW > 4608)      scale = JPEG_SCALE_EIGHTH;   // /8
-    else if (origW > 2304) scale = JPEG_SCALE_QUARTER;  // /4
-    else if (origW > 1152) scale = JPEG_SCALE_HALF;     // /2
+    int divisor = 1;
 
-    int divisor = scale ? scale : 1;
-    imgDecodedWidth = origW / divisor;
-    imgHeight = origH / divisor;
+    for (int i = startIdx; i < 4; i++) {
+        scale = scaleOptions[i];
+        divisor = scale ? scale : 1;
 
-    if (imgDecodedWidth > IMG_WIDTH) imgDecodedWidth = IMG_WIDTH;
-    if (imgHeight > IMG_MAX_HEIGHT) imgHeight = IMG_MAX_HEIGHT;
+        imgDecodedWidth = min(origW / divisor, IMG_WIDTH);
+        imgHeight = min(origH / divisor, IMG_MAX_HEIGHT);
+        imgOffsetX = max((IMG_WIDTH - imgDecodedWidth) / 2, 0);
 
-    // Центрируем если уже 576
-    imgOffsetX = (IMG_WIDTH - imgDecodedWidth) / 2;
-    if (imgOffsetX < 0) imgOffsetX = 0;
+        size_t bitmapSize = (size_t)IMG_BYTES_ROW * imgHeight;
 
-    // Выделяем bitmap (calloc = заполнен нулями = белый)
-    size_t bitmapSize = (size_t)IMG_BYTES_ROW * imgHeight;
-    imgBitmap = (uint8_t*)calloc(1, bitmapSize);
-    if (!imgBitmap) {
-        Serial.printf("malloc failed (bitmap %d bytes)\n", bitmapSize);
-        jpeg.close();
-        return false;
+        // Пробуем PSRAM, затем обычную RAM
+        imgBitmap = (uint8_t*)heap_caps_calloc(1, bitmapSize, MALLOC_CAP_SPIRAM);
+        if (!imgBitmap) imgBitmap = (uint8_t*)calloc(1, bitmapSize);
+
+        if (imgBitmap) {
+            Serial.printf("OK: 1/%d, %dx%d, %d bytes\n",
+                          divisor, imgDecodedWidth, imgHeight, bitmapSize);
+            break;
+        }
+        Serial.printf("No RAM: 1/%d needs %d bytes (free=%d)\n",
+                      divisor, bitmapSize, ESP.getFreeHeap());
     }
 
-    Serial.printf("Decode: scale=1/%d, size=%dx%d, offset=%d\n",
-                  divisor, imgDecodedWidth, imgHeight, imgOffsetX);
+    if (!imgBitmap) {
+        Serial.println("Не хватает памяти даже при 1/8");
+        jpeg.close();
+        free(jpegData);
+        return false;
+    }
 
     jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
     jpeg.decode(0, 0, scale);
     jpeg.close();
 
+    // Освобождаем JPEG ДО печати — высвобождаем ~100KB
+    free(jpegData);
+
     // Печатаем
+    Serial.printf("Печать... free RAM: %d\n", ESP.getFreeHeap());
     setupCyrillic();
     printRasterImage(imgBitmap, imgHeight);
     feedDots(80);
