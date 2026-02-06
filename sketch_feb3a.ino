@@ -448,27 +448,32 @@ void frameTest() {
     }
     middle += "*";
 
+    // Строка с текстом в режиме двойной ширины+высоты+жирный
+    // ESC ! n: bit3=жирный, bit4=двойная высота, bit5=двойная ширина = 0x38
+    // При двойной ширине на строку помещается 24 символа
+    const uint8_t dwLineWidth = 24;
     String text = "ТЕСТОВОЕ";
+    uint8_t textLen = 8;
     String textLine = "*";
-    uint8_t innerWidth = lineWidth - 2;
-    uint8_t textLen = 8;  // Длина слова "ТЕСТОВОЕ" в символах
-    uint8_t leftPad = (innerWidth > textLen) ? (innerWidth - textLen) / 2 : 0;
-    uint8_t rightPad = (innerWidth > textLen) ? (innerWidth - textLen - leftPad) : 0;
-
-    for (uint8_t i = 0; i < leftPad; i++) {
-        textLine += " ";
-    }
+    uint8_t innerWidth = dwLineWidth - 2;  // 22
+    uint8_t leftPad = (innerWidth - textLen) / 2;   // 7
+    uint8_t rightPad = innerWidth - textLen - leftPad;
+    for (uint8_t i = 0; i < leftPad; i++) textLine += " ";
     textLine += text;
-    for (uint8_t i = 0; i < rightPad; i++) {
-        textLine += " ";
-    }
+    for (uint8_t i = 0; i < rightPad; i++) textLine += " ";
     textLine += "*";
 
     printCyrillicLine(topBottom);
     for (uint8_t i = 0; i < 3; i++) {
         printCyrillicLine(middle);
     }
+
+    // Включаем двойную ширину + двойную высоту + жирный
+    sendCommand(0x1B, 0x21, 0x38);
     printCyrillicLine(textLine);
+    // Возврат к обычному режиму
+    sendCommand(0x1B, 0x21, 0x00);
+
     for (uint8_t i = 0; i < 3; i++) {
         printCyrillicLine(middle);
     }
