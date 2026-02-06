@@ -30,6 +30,7 @@ void setup() {
     Serial.println("  a - расширенный тест (чек на русском)");
     Serial.println("  r - тест кириллицы");
     Serial.println("  b - тест штрихкода и QR");
+    Serial.println("  f - рамка из * с текстом ТЕСТОВОЕ");
 }
 
 void loop() {
@@ -52,6 +53,9 @@ void loop() {
                 break;
             case 'b':
                 barcodeQRTest();
+                break;
+            case 'f':
+                frameTest();
                 break;
             default:
                 Serial.println("Неизвестная команда");
@@ -423,4 +427,55 @@ void barcodeQRTest() {
     partialCut();
     
     Serial.println("Готово!");
+}
+
+
+// Режим печати квадратной рамки из символа *
+void frameTest() {
+    Serial.println("Печать рамки из *...");
+
+    setupCyrillic();
+
+    const uint8_t lineWidth = 32;
+    String topBottom = "";
+    for (uint8_t i = 0; i < lineWidth; i++) {
+        topBottom += "*";
+    }
+
+    String middle = "*";
+    for (uint8_t i = 0; i < lineWidth - 2; i++) {
+        middle += " ";
+    }
+    middle += "*";
+
+    String text = "ТЕСТОВОЕ";
+    String textLine = "*";
+    uint8_t innerWidth = lineWidth - 2;
+    uint8_t textLen = 8;  // Длина слова "ТЕСТОВОЕ" в символах
+    uint8_t leftPad = (innerWidth > textLen) ? (innerWidth - textLen) / 2 : 0;
+    uint8_t rightPad = (innerWidth > textLen) ? (innerWidth - textLen - leftPad) : 0;
+
+    for (uint8_t i = 0; i < leftPad; i++) {
+        textLine += " ";
+    }
+    textLine += text;
+    for (uint8_t i = 0; i < rightPad; i++) {
+        textLine += " ";
+    }
+    textLine += "*";
+
+    printCyrillicLine(topBottom);
+    for (uint8_t i = 0; i < 3; i++) {
+        printCyrillicLine(middle);
+    }
+    printCyrillicLine(textLine);
+    for (uint8_t i = 0; i < 3; i++) {
+        printCyrillicLine(middle);
+    }
+    printCyrillicLine(topBottom);
+
+    feedDots(100);
+    partialCut();
+
+    Serial.println("Рамка распечатана!");
 }
